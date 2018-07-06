@@ -1,13 +1,13 @@
 'use strict'
 require('dotenv').config()
 const server = require('kth-node-server')
-const prefix = '/app/build-monitor'
 const express = require('express')
 const path = require('path')
 const rp = require('request-promise')
+const sisErrors = require('@kth/collect_sis_imports_errors/sis_utils')
+const moment = require('moment')
 
-
-/// const log = require('./server/log')
+const prefix = '/app/build-monitor'
 const PORT = process.env.SERVER_PORT || process.env.PORT || 3000
 
 /* ****************************
@@ -18,7 +18,6 @@ const PORT = process.env.SERVER_PORT || process.env.PORT || 3000
 server.start({
   useSsl: false,
   port: PORT
-  /// logger: log
 })
 server.use(prefix + '/bootstrap', express.static(path.join(__dirname, '/node_modules/bootstrap/dist')))
 server.use(prefix + '/kth-style', express.static(path.join(__dirname, '/node_modules/kth-style/dist')))
@@ -27,19 +26,20 @@ async function jenkinsApi (url, token) {
   try {
     const data = await rp({
       //    host: 'test.example.com',
-   //port: 443,
-   //path: '/api/service/'+servicename,
+      // port: 443,
+      // path: '/api/service/'+servicename,
       url,
       resolveWithFullResponse: false,
       method: 'GET',
       json: true,
       headers: {
-        'Authorization': 'Basic ' + new Buffer(process.env.JENKINS_USER + ':' + token).toString('base64')
+        'Authorization': 'Basic ' + Buffer.from(process.env.JENKINS_USER + ':' + token).toString('base64')
       }
     })
     return data.jobs
   } catch (e) {
-    console.log(`Smth went wrong while getting data from ${url.split('@')[1]}: `, e)
+    // ToDo: Decide now to handle logging.
+    console.error(`Something went wrong while getting data from ${url.split('@')[1]}: `, e)
     return []
   }
 }
@@ -97,7 +97,28 @@ async function getStatusFromJenkins (req, res) {
   `)
 }
 
+async function getStatusFromScript (req, res) {
+  // ToDo: What we'd want here is basically a way to fetch the latest logs and display them in a nice manner
+  // ToDo: Ought to have some badass local storage which prevents unnecessary fetching, maybe a button to trigger it manually if need be.
+  // Note: Tip from "Micke T": https://docs.microsoft.com/en-us/azure/storage/blobs/storage-quickstart-blobs-nodejs
+  const from = moment().subtract(1, 'days').utc().toDate().toISOString()
+  try {
+    const latestErrors = await sisErrors.getFilteredErrors(process.env.CANVAS_API_BASE_URL,
+      process.env.CANVAS_ACCESS_TOKEN,
+      from,
+      process.env.UG_URL,
+      process.env.UG_USERNAME,
+      process.env.UG_PWD)
+    res.send(latestErrors)
+  } catch (e) {
+    console.error('The shit hit the fan!')
+    res.send(e)
+  }
+}
+
 server.get(prefix + '/test', getStatusFromJenkins)
 
 server.get(prefix + '/_monitor', (req, res) =>
-    res.type('text').status(200).send('APPLICATION_STATUS OK'))
+  res.type('text').status(200).send('APPLICATION_STATUS OK'))
+
+server.get(prefix + '/canvas_imports', getStatusFromScript)
