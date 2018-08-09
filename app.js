@@ -4,11 +4,30 @@ const server = require('kth-node-server')
 const express = require('express')
 const path = require('path')
 const rp = require('request-promise')
-const sisErrors = require('@kth/collect_sis_imports_errors/sis_utils')
+const sisUtils = require('@kth/collect_sis_imports_errors/sis_utils')
 const moment = require('moment')
+const storage = require('azure-storage')
+const bunyan = require('bunyan')
 
+const logLevel = process.env.BUNYAN_LOG_LEVEL || 'info'
+const log = bunyan.createLogger({
+  name: 'build-monitor',
+  level: logLevel
+})
 const prefix = '/app/build-monitor'
 const PORT = process.env.SERVER_PORT || process.env.PORT || 3000
+const blobService = storage.createBlobService()
+const containerName = 'elearningbmcontainer'
+const templateFileText = JSON.stringify({timeStamp: 0, log: 'no logs have yet been fetched'})
+const blobName = 'bmblob'
+const blobStatuses = Object.freeze({
+  BLOB_MISSING: Symbol('blob_missing'),
+  BLOB_CONTAINER_MISSING: Symbol('blob_container_missing'),
+  BLOB_DOWNLOADED: Symbol('blob_downloaded'),
+  BLOB_CONTAINER_CREATED: Symbol('blob_container_created'),
+  BLOB_CREATED: Symbol('blob_created')
+})
+const newlineRegExp = /\n/g
 
 /* ****************************
  * ******* SERVER START *******
@@ -17,17 +36,27 @@ const PORT = process.env.SERVER_PORT || process.env.PORT || 3000
 
 server.start({
   useSsl: false,
-  port: PORT
+  port: PORT,
+  logger: log
 })
 server.use(prefix + '/bootstrap', express.static(path.join(__dirname, '/node_modules/bootstrap/dist')))
 server.use(prefix + '/kth-style', express.static(path.join(__dirname, '/node_modules/kth-style/dist')))
 
+async function setBlob (text) {
+  return new Promise((resolve, reject) => {
+    blobService.createBlockBlobFromText(containerName, blobName, text, err => {
+      if (err) {
+        reject(err)
+      } else {
+        resolve(blobStatuses.BLOB_CREATED)
+      }
+    })
+  })
+}
+
 async function jenkinsApi (url, token) {
   try {
     const data = await rp({
-      //    host: 'test.example.com',
-      // port: 443,
-      // path: '/api/service/'+servicename,
       url,
       resolveWithFullResponse: false,
       method: 'GET',
@@ -38,7 +67,6 @@ async function jenkinsApi (url, token) {
     })
     return data.jobs
   } catch (e) {
-    // ToDo: Decide now to handle logging.
     console.error(`Something went wrong while getting data from ${url.split('@')[1]}: `, e)
     return []
   }
@@ -97,22 +125,75 @@ async function getStatusFromJenkins (req, res) {
   `)
 }
 
-async function getStatusFromScript (req, res) {
-  // ToDo: What we'd want here is basically a way to fetch the latest logs and display them in a nice manner
-  // ToDo: Ought to have some badass local storage which prevents unnecessary fetching, maybe a button to trigger it manually if need be.
-  // Note: Tip from "Micke T": https://docs.microsoft.com/en-us/azure/storage/blobs/storage-quickstart-blobs-nodejs
-  const from = moment().subtract(1, 'days').utc().toDate().toISOString()
+async function getCanvasImportErrors (req, res) {
+  let cachedLog = JSON.parse(templateFileText)
   try {
-    const latestErrors = await sisErrors.getFilteredErrors(process.env.CANVAS_API_BASE_URL,
-      process.env.CANVAS_ACCESS_TOKEN,
-      from,
-      process.env.UG_URL,
-      process.env.UG_USERNAME,
-      process.env.UG_PWD)
-    res.send(latestErrors)
+    let result = await new Promise((resolve, reject) => {
+      blobService.getBlobToText(containerName, blobName, (err, text) => {
+        if (err) {
+          if (err.name === 'StorageError' && err.code === 'ContainerNotFound') {
+            resolve(blobStatuses.BLOB_CONTAINER_MISSING)
+          } else if (err.name === 'StorageError' && err.code === 'BlobNotFound') {
+            resolve(blobStatuses.BLOB_MISSING)
+          } else {
+            reject(err)
+          }
+        } else {
+          cachedLog = JSON.parse(text)
+          resolve(blobStatuses.BLOB_DOWNLOADED)
+        }
+      })
+    })
+    if (result === blobStatuses.BLOB_CONTAINER_MISSING) {
+      result = await new Promise((resolve, reject) => {
+        blobService.createContainer(containerName, {publicAccessLevel: 'blob'}, err => {
+          if (err) {
+            reject(err)
+          } else {
+            resolve(blobStatuses.BLOB_CONTAINER_CREATED)
+          }
+        })
+      })
+    }
+    if (result === blobStatuses.BLOB_CONTAINER_CREATED ||
+      result === blobStatuses.BLOB_MISSING) {
+      result = await setBlob(templateFileText)
+      if (result === blobStatuses.BLOB_CREATED) {
+        log.info('A new blob was created.')
+      }
+    }
   } catch (e) {
-    console.error('The shit hit the fan!')
-    res.send(e)
+    log.error('Something went horribly wrong when trying to fetch the blob.')
+    log.error(e)
+    return res.send(e)
+  }
+
+  res.send(`
+    <html>
+      <head>
+        <meta charset=utf-8>
+        <title>SIS IMPORT ERRORS</title>
+        <meta http-equiv="refresh" content="10">
+        <link rel="stylesheet" href="/app/build-monitor/bootstrap/css/bootstrap.css">
+        <link rel="stylesheet" href="/app/build-monitor/kth-style/css/kth-bootstrap.css">
+        <h1>Error logs found</h1>
+        <p>${cachedLog.log.replace(newlineRegExp, '<br>')}</p>
+  `)
+
+  const now = moment().format('x')
+  if ((now - cachedLog.timeStamp) > process.env.LOG_TTL) {
+    const from = moment().subtract(7, 'days').utc().toDate().toISOString()
+    try {
+      const latestErrors = await sisUtils.getFilteredErrors(process.env.CANVAS_API_BASE_URL,
+        process.env.CANVAS_ACCESS_TOKEN,
+        from,
+        process.env.UG_URL,
+        process.env.UG_USERNAME,
+        process.env.UG_PWD)
+      setBlob(JSON.stringify({timeStamp: now, log: latestErrors}))
+    } catch (e) {
+      log.error(`Failed to renew logs: ${e}`)
+    }
   }
 }
 
@@ -121,4 +202,4 @@ server.get(prefix + '/test', getStatusFromJenkins)
 server.get(prefix + '/_monitor', (req, res) =>
   res.type('text').status(200).send('APPLICATION_STATUS OK'))
 
-server.get(prefix + '/canvas_imports', getStatusFromScript)
+server.get(prefix + '/canvas_import_errors', getCanvasImportErrors)
